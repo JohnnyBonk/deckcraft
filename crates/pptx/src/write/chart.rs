@@ -1,7 +1,7 @@
 //! Chart parts: a `c:chartSpace` with cached categories and values.
 //! An unchanged chart also keeps the embedded workbook and the other parts it points at.
 
-use deckcraft_model::chart::{Chart, ChartType, Series, Trendline, TrendlineType};
+use deckcraft_model::chart::{Chart, ChartType, PointLabel, Series, Trendline, TrendlineType};
 use deckcraft_model::style::Fill;
 
 use crate::opc::{NS_A, NS_C, NS_R};
@@ -216,8 +216,11 @@ fn series(w: &mut W, c: &Chart, s: &Series, i: usize, kind: ChartType, g: Group)
             w.close("c:dPt");
         }
     }
-    if let Some(d) = s.data_labels {
-        data_labels(w, d);
+    if !s.point_labels.is_empty() {
+        // Series labels replace the group's, so they show what the chart does unless set.
+        data_labels(w, s.data_labels.unwrap_or(c.data_labels), &s.point_labels, g, kind.stacked());
+    } else if let Some(d) = s.data_labels {
+        data_labels(w, d, &[], g, false);
     }
     // After labels, before the category and value caches (ECMA-376 series content order).
     if matches!(g, Group::Bar | Group::Line | Group::Area | Group::Scatter) {
@@ -325,8 +328,7 @@ fn trendline(w: &mut W, t: &Trendline) {
     w.close("c:trendline");
 }
 
-fn data_labels(w: &mut W, show: bool) {
-    w.open0("c:dLbls");
+fn show_flags(w: &mut W, show: bool) {
     for (n, v) in [
         ("c:showLegendKey", false),
         ("c:showVal", show),
@@ -337,7 +339,84 @@ fn data_labels(w: &mut W, show: bool) {
     ] {
         w.val(n, if v { 1 } else { 0 });
     }
+}
+
+/// `c:dLbls`: the per-point `c:dLbl` overrides first, then the series' (or group's) own flags.
+fn data_labels(w: &mut W, show: bool, points: &[(usize, PointLabel)], g: Group, stacked: bool) {
+    w.open0("c:dLbls");
+    for (idx, p) in points.iter().take(10_000) {
+        point_label(w, *idx, p, g, stacked);
+    }
+    show_flags(w, show);
     w.close("c:dLbls");
+}
+
+/// The `c:dLblPos` values a chart type allows on its labels; PowerPoint repairs a file whose
+/// label sits somewhere its chart type can't put one (a stacked bar has no outside end).
+fn label_pos_allowed(g: Group, stacked: bool, pos: &str) -> bool {
+    match g {
+        Group::Bar if stacked => matches!(pos, "inEnd" | "ctr" | "inBase"),
+        Group::Bar => matches!(pos, "outEnd" | "inEnd" | "ctr" | "inBase"),
+        Group::Line | Group::Scatter | Group::Bubble | Group::Stock => matches!(pos, "t" | "b" | "l" | "r" | "ctr"),
+        Group::Pie => matches!(pos, "bestFit" | "outEnd" | "inEnd" | "ctr"),
+        Group::Doughnut | Group::Area | Group::Radar => false,
+    }
+}
+
+/// One `c:dLbl` in the schema's order: idx, then delete, or tx, txPr, dLblPos and the flags.
+fn point_label(w: &mut W, idx: usize, p: &PointLabel, g: Group, stacked: bool) {
+    w.open0("c:dLbl");
+    w.val("c:idx", idx);
+    if p.delete {
+        w.val("c:delete", 1);
+        w.close("c:dLbl");
+        return;
+    }
+    let run = |w: &mut W, tag: &str| {
+        let size = p.size.filter(|v| v.is_finite()).map(|v| (v.clamp(1.0, 400.0) * 100.0).round() as i64);
+        let a = A::new().o("sz", size).b("b", p.bold);
+        match &p.color {
+            Some(cc) => {
+                w.open(tag, a);
+                super::dml::solid(w, cc);
+                w.close(tag);
+            }
+            None => w.empty(tag, a),
+        }
+    };
+    if let Some(text) = &p.text {
+        w.open0("c:tx");
+        w.open0("c:rich");
+        w.empty0("a:bodyPr");
+        w.empty0("a:lstStyle");
+        for line in text.split('\n') {
+            w.open0("a:p");
+            w.open0("a:r");
+            run(w, "a:rPr");
+            w.elt("a:t", line);
+            w.close("a:r");
+            w.close("a:p");
+        }
+        w.close("c:rich");
+        w.close("c:tx");
+    } else if p.size.is_some() || p.bold.is_some() || p.color.is_some() {
+        w.open0("c:txPr");
+        w.empty0("a:bodyPr");
+        w.empty0("a:lstStyle");
+        w.open0("a:p");
+        w.open0("a:pPr");
+        run(w, "a:defRPr");
+        w.close("a:pPr");
+        w.empty("a:endParaRPr", A::new().a("lang", "en-US"));
+        w.close("a:p");
+        w.close("c:txPr");
+    }
+    if let Some(pos) = p.position.as_deref().filter(|pos| label_pos_allowed(g, stacked, pos)) {
+        w.val("c:dLblPos", pos);
+    }
+    // The file's value flag; a label with custom text and none shows its text.
+    show_flags(w, p.show_val.unwrap_or(p.text.is_some()));
+    w.close("c:dLbl");
 }
 
 const AX_CAT: u32 = 50_001;
@@ -468,7 +547,7 @@ fn plot_group(w: &mut W, c: &Chart, kind: ChartType, list: &[(usize, &Series)]) 
         series(w, c, s, *i, kind, g);
     }
     if c.data_labels {
-        data_labels(w, true);
+        data_labels(w, true, &[], g, false);
     }
     match g {
         Group::Bar => {
@@ -982,5 +1061,37 @@ mod tests {
         assert!(crate::read::chart::read_chart_xml(&xml).unwrap().cat_reversed);
         c.cat_reversed = false;
         assert!(!crate::read::chart::read_chart_xml(&super::chart_xml(&c).0).unwrap().cat_reversed);
+    }
+
+    #[test]
+    fn per_point_labels_are_written_in_schema_order() {
+        // Read PowerPoint-style per-point labels, then write the chart afresh (not the kept XML).
+        let mut c = crate::read::chart::read_chart_xml(crate::read::chart::tests::POINT_LABELS_XML.as_bytes()).unwrap();
+        c.raw = None;
+        let xml = String::from_utf8(super::chart_xml(&c).0).unwrap();
+        let at = |needle: &str| xml.find(needle).unwrap_or_else(|| panic!("{needle} missing from {xml}"));
+        // c:dLbl entries come first in c:dLbls; in each: idx, then delete or tx … dLblPos, flags.
+        let ser_flags = xml[at("<c:dLbls>")..].find("</c:dLbl><c:showLegendKey").map(|i| i + at("<c:dLbls>")).unwrap();
+        assert!(at(r#"<c:idx val="0"/><c:delete val="1"/></c:dLbl>"#) < at("162 g"));
+        assert!(at(r#"<c:idx val="1"/><c:tx><c:rich>"#) < at("162 g"));
+        assert!(at("162 g") < at(r#"<c:dLblPos val="outEnd"/>"#));
+        assert!(at(r#"<c:dLblPos val="outEnd"/><c:showLegendKey val="0"/><c:showVal val="1"/>"#) < ser_flags);
+        assert!(xml.contains(r#"<a:rPr sz="1200" b="1"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:rPr>"#), "{xml}");
+        let back = crate::read::chart::read_chart_xml(xml.as_bytes()).unwrap();
+        assert_eq!(back.series[0].point_labels, c.series[0].point_labels);
+        assert_eq!(back.series[0].data_labels, Some(false));
+    }
+
+    #[test]
+    fn label_positions_a_chart_type_cannot_take_are_dropped() {
+        use deckcraft_model::chart::PointLabel;
+        let mut c = Chart::sample(ChartType::StackedColumn);
+        let p = PointLabel { text: Some("x".into()), position: Some("outEnd".into()), ..Default::default() };
+        c.series[0].point_labels = vec![(0, p.clone())];
+        let xml = String::from_utf8(super::chart_xml(&c).0).unwrap();
+        assert!(xml.contains("<c:dLbl>") && !xml.contains("c:dLblPos"), "{xml}");
+        c.kind = ChartType::Column;
+        let xml = String::from_utf8(super::chart_xml(&c).0).unwrap();
+        assert!(xml.contains(r#"<c:dLblPos val="outEnd"/>"#), "{xml}");
     }
 }

@@ -1,6 +1,6 @@
 //! Chart parts (`c:chartSpace`) → [`Chart`]. The original XML is kept in `Chart.raw`.
 
-use deckcraft_model::chart::{Chart, ChartType, ErrorBars, Series, Trendline, TrendlineType};
+use deckcraft_model::chart::{Chart, ChartType, ErrorBars, PointLabel, Series, Trendline, TrendlineType};
 use deckcraft_model::style::Fill;
 
 use crate::xml::El;
@@ -233,6 +233,15 @@ fn chart_within(root: &El, mut budget: usize) -> Option<Chart> {
             if let Some(d) = s.child("dLbls").and_then(|d| d.child("showVal")).and_then(|v| v.bool("val")) {
                 ser.data_labels = Some(d);
             }
+            if let Some(d) = s.child("dLbls") {
+                // Each override takes a slot of the chart's point budget.
+                for l in d.children_named("dLbl").take(MAX_POINT_LABELS.min(budget)) {
+                    if let Some(i) = l.child("idx").and_then(|i| i.u32("val")) {
+                        ser.point_labels.push((i as usize, point_label(l)));
+                    }
+                }
+                budget = budget.saturating_sub(ser.point_labels.len());
+            }
             for t in s.children_named("trendline").take(16) {
                 if let Some(t) = trendline(t) {
                     ser.trendlines.push(t);
@@ -358,6 +367,50 @@ fn chart_within(root: &El, mut budget: usize) -> Option<Chart> {
     c.text_color = [val_ax, cat_ax, ch.child("legend"), Some(root)].into_iter().flatten().find_map(|e| text_color(e.child("txPr")));
     c.title_size = ch.child("title").and_then(|t| text_size(t.child("tx").and_then(|x| x.child("rich"))).or_else(|| text_size(t.child("txPr"))));
     Some(c)
+}
+
+/// Most per-point label overrides read from one series.
+const MAX_POINT_LABELS: usize = 10_000;
+
+/// One `c:dLbl`: custom text (rich text or a string reference's cache), `c:delete`, position,
+/// `c:showVal`, and the first run's size, weight and colour.
+fn point_label(l: &El) -> PointLabel {
+    let bool_of = |k: &str| l.child(k).and_then(|v| v.bool("val"));
+    if bool_of("delete") == Some(true) {
+        return PointLabel { delete: true, ..Default::default() };
+    }
+    let rich = l.child("tx").and_then(|t| t.child("rich"));
+    let fmt = rich.or_else(|| l.child("txPr"));
+    PointLabel {
+        text: rich_text(l).map(|t| t.chars().take(4096).collect()),
+        delete: false,
+        show_val: bool_of("showVal"),
+        position: l.child_val("dLblPos").filter(|p| p.len() <= 16).map(str::to_string),
+        size: text_size(fmt).or_else(|| text_size(l.child("txPr"))),
+        bold: run_bold(fmt).or_else(|| run_bold(l.child("txPr"))),
+        color: text_color(fmt).or_else(|| text_color(l.child("txPr"))),
+    }
+}
+
+/// The `b` attribute of the first `a:rPr`/`a:defRPr` under `e` that sets one.
+fn run_bold(e: Option<&El>) -> Option<bool> {
+    fn rec(e: &El, depth: usize) -> Option<bool> {
+        if depth > 8 {
+            return None;
+        }
+        for c in e.elements() {
+            if (c.is("defRPr") || c.is("rPr"))
+                && let Some(b) = c.bool("b")
+            {
+                return Some(b);
+            }
+            if let Some(v) = rec(c, depth + 1) {
+                return Some(v);
+            }
+        }
+        None
+    }
+    rec(e?, 0)
 }
 
 fn trend_num(e: &El, k: &str) -> Option<f64> {
@@ -518,7 +571,7 @@ fn text_size(e: Option<&El>) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -746,5 +799,46 @@ mod tests {
     fn explicit_vary_colors_is_respected() {
         assert!(read_chart_xml(vary_xml(r#"<c:varyColors val="0"/>"#).as_bytes()).is_some_and(|c| !c.vary_colors));
         assert!(read_chart_xml(vary_xml(r#"<c:varyColors val="1"/>"#).as_bytes()).is_some_and(|c| c.vary_colors));
+    }
+
+    /// A column series as PowerPoint and LibreOffice write custom labels: per-point `c:dLbl`
+    /// overrides inside the series' `c:dLbls`, which itself shows no values. Self-closing tags
+    /// carry a space before the slash, as those apps write them.
+    pub(crate) const POINT_LABELS_XML: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:barChart><c:barDir val="col" /><c:grouping val="clustered" /><c:ser><c:idx val="0" /><c:order val="0" /><c:tx><c:v>Footprint</c:v></c:tx><c:dLbls><c:dLbl><c:idx val="0" /><c:delete val="1" /></c:dLbl><c:dLbl><c:idx val="1" /><c:tx><c:rich><a:bodyPr /><a:p><a:r><a:rPr lang="en-US" sz="1200" b="1"><a:solidFill><a:srgbClr val="FF0000" /></a:solidFill></a:rPr><a:t>162 g (−33%)</a:t></a:r></a:p></c:rich></c:tx><c:dLblPos val="outEnd" /><c:showLegendKey val="0" /><c:showVal val="1" /><c:showCatName val="0" /><c:showSerName val="0" /><c:showPercent val="0" /><c:showBubbleSize val="0" /></c:dLbl><c:dLbl><c:idx val="2" /><c:tx><c:strRef><c:f>Sheet1!$D$4</c:f><c:strCache><c:ptCount val="1" /><c:pt idx="0"><c:v>via ref</c:v></c:pt></c:strCache></c:strRef></c:tx><c:dLblPos val="inEnd" /><c:showVal val="1" /></c:dLbl><c:showLegendKey val="0" /><c:showVal val="0" /><c:showCatName val="0" /><c:showSerName val="0" /><c:showPercent val="0" /><c:showBubbleSize val="0" /></c:dLbls><c:cat><c:strRef><c:strCache><c:ptCount val="4" /><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt><c:pt idx="2"><c:v>C</c:v></c:pt><c:pt idx="3"><c:v>D</c:v></c:pt></c:strCache></c:strRef></c:cat><c:val><c:numRef><c:numCache><c:ptCount val="4" /><c:pt idx="0"><c:v>243</c:v></c:pt><c:pt idx="1"><c:v>162</c:v></c:pt><c:pt idx="2"><c:v>120</c:v></c:pt><c:pt idx="3"><c:v>90</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser><c:axId val="1" /><c:axId val="2" /></c:barChart><c:catAx><c:axId val="1" /></c:catAx><c:valAx><c:axId val="2" /></c:valAx></c:plotArea></c:chart></c:chartSpace>"#;
+
+    #[test]
+    fn per_point_labels_are_read_from_the_series() {
+        use deckcraft_model::chart::PointLabel;
+        let c = read_chart_xml(POINT_LABELS_XML.as_bytes()).unwrap();
+        let s = &c.series[0];
+        assert!(!c.data_labels);
+        assert_eq!(s.data_labels, Some(false));
+        let red = deckcraft_model::ColorRef::rgb(deckcraft_color::Rgba::rgb(255, 0, 0));
+        assert_eq!(
+            s.point_labels,
+            vec![
+                (0, PointLabel { delete: true, ..Default::default() }),
+                (
+                    1,
+                    PointLabel {
+                        text: Some("162 g (−33%)".into()),
+                        show_val: Some(true),
+                        position: Some("outEnd".into()),
+                        size: Some(12.0),
+                        bold: Some(true),
+                        color: Some(red),
+                        ..Default::default()
+                    }
+                ),
+                (2, PointLabel { text: Some("via ref".into()), show_val: Some(true), position: Some("inEnd".into()), ..Default::default() }),
+            ]
+        );
+        // Deleted, custom, custom from a reference, and a point without an override: the series
+        // shows no values, so it has no label.
+        let label = |i: usize| c.point_label(s, i, s.values.get(i).copied().flatten()).map(|(t, _)| t);
+        assert_eq!(label(0), None);
+        assert_eq!(label(1).as_deref(), Some("162 g (−33%)"));
+        assert_eq!(label(2).as_deref(), Some("via ref"));
+        assert_eq!(label(3), None);
     }
 }

@@ -1920,3 +1920,69 @@ fn zoom_inserts_linked_slide_pictures() {
     assert!(s.execute("insert.zoom", &json!({"slides": [42]})).is_err());
     assert!(s.execute("insert.zoom", &json!({"kind": "slide"})).is_err());
 }
+
+/// Per-point data labels (custom text, a deleted label, position and run formatting) survive a
+/// save and a load, and a second save that writes the chart afresh instead of reusing its XML.
+#[test]
+fn per_point_chart_labels_round_trip() {
+    use deckcraft_model::chart::PointLabel;
+    let mut p = defaults::new_presentation(None);
+    let mut s = p.slides[0].as_ref().clone();
+    let red = ColorRef::rgb(Rgba::rgb(255, 0, 0));
+    let labels = vec![
+        (0, PointLabel { delete: true, ..Default::default() }),
+        (
+            1,
+            PointLabel {
+                text: Some("162 g (−33%)\nper kg".into()),
+                show_val: Some(true),
+                position: Some("inEnd".into()),
+                size: Some(14.0),
+                bold: Some(true),
+                color: Some(red),
+                ..Default::default()
+            },
+        ),
+        (2, PointLabel { show_val: Some(true), size: Some(9.0), ..Default::default() }),
+    ];
+    for (i, kind, pos) in [(0, ChartType::Column, "inEnd"), (1, ChartType::Bar, "inEnd"), (2, ChartType::Line, "t")] {
+        let mut c = Chart::sample(kind);
+        let mut l = labels.clone();
+        l[1].1.position = Some(pos.into());
+        c.series[0].point_labels = l;
+        let mut sh = shape(&mut p, &format!("Labelled {i}"), 20.0 + i as f64 * 300.0, 100.0, 280.0, 200.0);
+        sh.kind = ShapeKind::Chart(Box::new(c));
+        s.shapes.push(sh);
+    }
+    p.slides[0] = Arc::new(s);
+    let charts = |p: &Presentation| -> Vec<Chart> {
+        p.slides[0]
+            .shapes
+            .iter()
+            .filter_map(|sh| match &sh.kind {
+                ShapeKind::Chart(c) => Some((**c).clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let q = round(&p);
+    let (a, b) = (charts(&p), charts(&q));
+    assert_eq!(a.len(), 3);
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x.series[0].point_labels, y.series[0].point_labels, "{:?}", x.kind);
+        // The other series have none.
+        assert!(y.series[1..].iter().all(|s| s.point_labels.is_empty()));
+    }
+    // Writing the chart afresh (not the kept XML) keeps them too.
+    let mut q2 = q.clone();
+    let mut s = q2.slides[0].as_ref().clone();
+    for sh in &mut s.shapes {
+        if let ShapeKind::Chart(c) = &mut sh.kind {
+            c.raw = None;
+        }
+    }
+    q2.slides[0] = Arc::new(s);
+    for (x, y) in a.iter().zip(&charts(&round(&q2))) {
+        assert_eq!(x.series[0].point_labels, y.series[0].point_labels, "{:?}", x.kind);
+    }
+}

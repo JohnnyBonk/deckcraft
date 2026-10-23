@@ -245,6 +245,49 @@ pub struct Series {
     /// `c:errBars` on the values (y bars; a bar chart's run along its value axis).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_bars: Option<ErrorBars>,
+    /// Per-point data label overrides (`c:dLbls/c:dLbl`), by point index, in file order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub point_labels: Vec<(usize, PointLabel)>,
+}
+
+/// One point's data label override (`c:dLbl`): custom text, a hidden label, or its own position
+/// and run formatting. Fields the file leaves out stay `None` and fall back to the series'.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PointLabel {
+    /// Custom text (`c:tx`, rich text or a string reference's cache); lines split by `\n`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `c:delete val="1"`: this point has no label.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub delete: bool,
+    /// `c:showVal`: whether the label shows the point's value (when it has no custom text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_val: Option<bool>,
+    /// `c:dLblPos`: `outEnd`, `inEnd`, `ctr`, `inBase`, `t`, `b`, `l`, `r`, `bestFit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// Text size in points (the first `a:rPr`/`a:defRPr` `sz`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<ColorRef>,
+}
+
+impl PointLabel {
+    /// The label this override draws for value `v`: its custom text, else the formatted value
+    /// when `c:showVal` is on; `None` when it is deleted or shows nothing.
+    pub fn text_for(&self, c: &Chart, s: &Series, v: Option<f64>) -> Option<String> {
+        if self.delete {
+            return None;
+        }
+        if let Some(t) = &self.text {
+            return Some(t.clone());
+        }
+        (self.show_val == Some(true)).then(|| v.map(|v| c.data_label(s, v))).flatten()
+    }
 }
 
 /// Error bars (`c:errBars`): how far each point's bar reaches below and above it.
@@ -699,6 +742,17 @@ impl Chart {
         crate::numfmt::format(code.map_or("General", String::as_str), v, self.lang.as_deref())
     }
 
+    /// The data label of point `i` of series `s` (value `v`) and its override, if it has one: the
+    /// override's text when the point has a `c:dLbl`, else the formatted value when the chart or
+    /// the series shows values. `None`: no label.
+    pub fn point_label<'a>(&self, s: &'a Series, i: usize, v: Option<f64>) -> Option<(String, Option<&'a PointLabel>)> {
+        match s.point_labels.iter().find(|(k, _)| *k == i) {
+            Some((_, p)) => p.text_for(self, s, v).map(|t| (t, Some(p))),
+            None if self.data_labels || s.data_labels == Some(true) => v.map(|v| (self.data_label(s, v), None)),
+            None => None,
+        }
+    }
+
     /// Value range across series (stacked sums for stacked types).
     pub fn value_range(&self) -> (f64, f64) {
         let mut lo: f64 = 0.0;
@@ -837,6 +891,27 @@ pub fn nice_scale(lo: f64, hi: f64) -> (f64, f64, f64) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn point_labels_survive_serde_and_old_files_load_without_them() {
+        let mut c = Chart::sample(ChartType::Column);
+        c.series[0].point_labels = vec![(1, PointLabel { text: Some("custom".into()), position: Some("ctr".into()), ..Default::default() })];
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Chart>(&json).unwrap(), c);
+        // A series without overrides writes no field, and one without the field reads as none.
+        let plain = serde_json::to_string(&Chart::sample(ChartType::Column)).unwrap();
+        assert!(!plain.contains("pointLabels"));
+        assert!(serde_json::from_str::<Chart>(&plain).unwrap().series[0].point_labels.is_empty());
+        // The override's text replaces the value, a deleted label hides it, and points without
+        // one follow the chart.
+        c.data_labels = true;
+        let s = &c.series[0];
+        assert_eq!(c.point_label(s, 1, Some(5.0)).map(|(t, _)| t).as_deref(), Some("custom"));
+        assert_eq!(c.point_label(s, 0, Some(5.0)).map(|(t, _)| t).as_deref(), Some("5"));
+        let mut d = c.clone();
+        d.series[0].point_labels[0].1 = PointLabel { delete: true, ..Default::default() };
+        assert!(d.point_label(&d.series[0], 1, Some(5.0)).is_none());
+    }
     use super::*;
 
     #[test]
