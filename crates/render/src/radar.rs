@@ -120,23 +120,23 @@ pub fn draw(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, area: Rec
                 }
             }
         }
-        if c.data_labels || s.data_labels == Some(true) {
-            for (i, q) in pts.iter().enumerate() {
-                if let Some(v) = s.values.get(i).copied().flatten() {
-                    let t = c.data_label(s, v);
-                    label(
-                        ctx,
-                        rctx,
-                        m,
-                        &t,
-                        Rect::new(q.x - 40.0, q.y - base * 1.4, q.x + 40.0, q.y - base * 0.2),
-                        base * 0.9,
-                        Align::Center,
-                        Anchor::Bottom,
-                        text_col,
-                        false,
-                    );
-                }
+        for (i, q) in pts.iter().enumerate() {
+            if let Some(v) = s.values.get(i).copied().flatten()
+                && let Some(pt) = crate::chart::point_text(rctx, c, s, i, Some(v), base * 0.9, text_col)
+            {
+                let hw = (pt.extent().0 / 2.0).max(40.0);
+                label(
+                    ctx,
+                    rctx,
+                    m,
+                    &pt.text,
+                    Rect::new(q.x - hw, q.y - base * 1.4, q.x + hw, q.y - base * 0.2),
+                    pt.size,
+                    Align::Center,
+                    Anchor::Bottom,
+                    pt.col,
+                    pt.bold,
+                );
             }
         }
     }

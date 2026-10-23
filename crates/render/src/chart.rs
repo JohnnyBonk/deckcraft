@@ -142,6 +142,90 @@ pub(crate) fn label(
     crate::draw_text(ctx, rctx, &tmp, &body, r, m, &deckcraft_text::NoFields, None);
 }
 
+/// A point's data label as drawn: its text, size, weight and colour (an override's, else the
+/// chart's), and the override's position.
+pub(crate) struct PointText<'a> {
+    pub text: String,
+    pub size: f64,
+    pub bold: bool,
+    pub col: Rgba,
+    pub pos: Option<&'a str>,
+}
+
+impl PointText<'_> {
+    /// About how wide and tall the label is, for placing it.
+    pub fn extent(&self) -> (f64, f64) {
+        let lines = self.text.split('\n');
+        let n = lines.clone().count().max(1) as f64;
+        let chars = lines.map(|l| l.chars().count()).max().unwrap_or(0) as f64;
+        (chars * self.size * 0.6 + 4.0, self.size * 1.56 * n)
+    }
+}
+
+/// The label of point `i` of series `s` (value `v`), if it has one, at `size` and `col` unless
+/// its override sets its own.
+pub(crate) fn point_text<'a>(
+    rctx: &Ctx,
+    c: &Chart,
+    s: &'a deckcraft_model::chart::Series,
+    i: usize,
+    v: Option<f64>,
+    size: f64,
+    col: Rgba,
+) -> Option<PointText<'a>> {
+    let (text, p) = c.point_label(s, i, v)?;
+    Some(PointText {
+        text,
+        size: p.and_then(|p| p.size).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(size),
+        bold: p.and_then(|p| p.bold).unwrap_or(false),
+        col: p.and_then(|p| p.color.as_ref()).map_or(col, |cc| rctx.color(cc, None)),
+        pos: p.and_then(|p| p.position.as_deref()),
+    })
+}
+
+/// Where a bar's label goes: (box, alignment, anchor). `r` is the bar, `neg` whether its value is
+/// negative (its end is then the bottom or left edge). Without a position it sits past the bar's
+/// top or right edge, as before positions were read.
+fn bar_label_box(r: Rect, horiz: bool, neg: bool, pos: Option<&str>, (tw, h): (f64, f64)) -> (Rect, Align, Anchor) {
+    if horiz {
+        let left_from = |x: f64| (Rect::new(x, r.y0, x + tw.max(38.0), r.y1), Align::Left, Anchor::Middle);
+        let right_to = |x: f64| (Rect::new(x - tw.max(38.0), r.y0, x, r.y1), Align::Right, Anchor::Middle);
+        match (pos, neg) {
+            (Some("outEnd"), true) => right_to(r.x0 - 2.0),
+            (Some("inEnd"), false) | (Some("inBase"), true) => right_to(r.x1 - 2.0),
+            (Some("inEnd"), true) | (Some("inBase"), false) => left_from(r.x0 + 2.0),
+            (Some("ctr"), _) => {
+                let cx = r.center().x;
+                (Rect::new(cx - tw / 2.0 - 2.0, r.y0, cx + tw / 2.0 + 2.0, r.y1), Align::Center, Anchor::Middle)
+            }
+            _ => left_from(r.x1 + 2.0),
+        }
+    } else {
+        let half = (r.width() / 2.0 + 10.0).max(tw / 2.0);
+        let cx = r.center().x;
+        let band = |y0: f64, y1: f64, anchor: Anchor| (Rect::new(cx - half, y0, cx + half, y1), Align::Center, anchor);
+        match (pos, neg) {
+            (Some("outEnd"), true) => band(r.y1, r.y1 + h, Anchor::Top),
+            (Some("inEnd"), false) | (Some("inBase"), true) => band(r.y0 + 2.0, r.y0 + 2.0 + h, Anchor::Top),
+            (Some("inEnd"), true) | (Some("inBase"), false) => band(r.y1 - 2.0 - h, r.y1 - 2.0, Anchor::Bottom),
+            (Some("ctr"), _) => band(r.center().y - h / 2.0, r.center().y + h / 2.0, Anchor::Middle),
+            _ => band(r.y0 - h, r.y0, Anchor::Bottom),
+        }
+    }
+}
+
+/// Where a line or scatter point's label goes: right of the point unless placed elsewhere
+/// (PowerPoint's default for these charts).
+fn point_label_box(q: Point, pos: Option<&str>, (tw, h): (f64, f64)) -> (Rect, Align, Anchor) {
+    match pos {
+        Some("t") => (Rect::new(q.x - tw / 2.0, q.y - 5.0 - h, q.x + tw / 2.0, q.y - 5.0), Align::Center, Anchor::Bottom),
+        Some("b") => (Rect::new(q.x - tw / 2.0, q.y + 5.0, q.x + tw / 2.0, q.y + 5.0 + h), Align::Center, Anchor::Top),
+        Some("l") => (Rect::new(q.x - 5.0 - tw, q.y - h / 2.0, q.x - 5.0, q.y + h / 2.0), Align::Right, Anchor::Middle),
+        Some("ctr") => (Rect::new(q.x - tw / 2.0, q.y - h / 2.0, q.x + tw / 2.0, q.y + h / 2.0), Align::Center, Anchor::Middle),
+        _ => (Rect::new(q.x + 5.0, q.y - h / 2.0, q.x + 5.0 + tw, q.y + h / 2.0), Align::Left, Anchor::Middle),
+    }
+}
+
 fn fmt_num(v: f64) -> String {
     if (v - v.round()).abs() < 1e-9 { format!("{}", v.round() as i64) } else { format!("{v:.1}") }
 }
@@ -310,20 +394,29 @@ fn draw_inner(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, w: f64,
             ctx.set_paint(color(Rgba::WHITE, 1.0));
             ctx.set_stroke(kurbo::Stroke::new(1.0));
             ctx.stroke_path(&p);
-            if c.data_labels {
+            // Labels sit inside the slice in white, or past its edge in the chart's text colour.
+            let outside = s.point_labels.iter().find(|(k, _)| *k == i).and_then(|(_, p)| p.position.as_deref()) == Some("outEnd");
+            if let Some(pt) = point_text(rctx, c, s, i, Some(*v), base, if outside { text_col } else { Rgba::WHITE }) {
                 let mid = a0 + sweep / 2.0;
-                let lp = Point::new(cen.x + r * 0.65 * mid.cos(), cen.y + r * 0.65 * mid.sin());
+                let (tw, th) = pt.extent();
+                let d = match pt.pos {
+                    Some("outEnd") => r + 4.0 + tw / 2.0 * mid.cos().abs() + th / 2.0 * mid.sin().abs(),
+                    Some("inEnd") => r * 0.8,
+                    _ => r * 0.65,
+                };
+                let lp = Point::new(cen.x + d * mid.cos(), cen.y + d * mid.sin());
+                let (hw, hh) = ((tw / 2.0).max(30.0), (th / 2.0).max(10.0));
                 label(
                     ctx,
                     rctx,
                     m,
-                    &c.data_label(s, *v),
-                    Rect::new(lp.x - 30.0, lp.y - 10.0, lp.x + 30.0, lp.y + 10.0),
-                    base,
+                    &pt.text,
+                    Rect::new(lp.x - hw, lp.y - hh, lp.x + hw, lp.y + hh),
+                    pt.size,
                     Align::Center,
                     Anchor::Middle,
-                    Rgba::WHITE,
-                    false,
+                    pt.col,
+                    pt.bold,
                 );
             }
             a0 += sweep;
@@ -656,25 +749,10 @@ fn draw_inner(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, w: f64,
                         err_marks.push((mid, p0, p1, bar.min(base * 0.8) * 0.5, e.end_cap));
                     }
                 }
-                if c.data_labels {
-                    let t = c.data_label(s, s.values.get(i).copied().flatten().unwrap_or(0.0));
-                    let lr = if horiz {
-                        Rect::new(r.x1 + 2.0, r.y0, r.x1 + 40.0, r.y1)
-                    } else {
-                        Rect::new(r.x0 - 10.0, r.y0 - base * 1.4, r.x1 + 10.0, r.y0)
-                    };
-                    label(
-                        ctx,
-                        rctx,
-                        m,
-                        &t,
-                        lr,
-                        base * 0.9,
-                        if horiz { Align::Left } else { Align::Center },
-                        if horiz { Anchor::Middle } else { Anchor::Bottom },
-                        text_col,
-                        false,
-                    );
+                let raw = s.values.get(i).copied().flatten();
+                if let Some(pt) = point_text(rctx, c, s, i, raw, base * 0.9, text_col) {
+                    let (lr, align, anchor) = bar_label_box(r, horiz, raw.is_some_and(|v| v < 0.0), pt.pos, pt.extent());
+                    label(ctx, rctx, m, &pt.text, lr, pt.size, align, anchor, pt.col, pt.bold);
                 }
             }
         }
@@ -697,8 +775,11 @@ fn draw_inner(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, w: f64,
         let area_kind = matches!(kind, ChartType::Area | ChartType::StackedArea | ChartType::FilledRadar);
         let col = if area_kind { series_fill(rctx, c, si, Some(s)) } else { series_line(rctx, c, si, s) };
         let mut pts = vec![];
+        // Labelled points: (where, index, value).
+        let mut labelled = vec![];
         for i in 0..ncat {
             let Some(v) = s.values.get(i).copied().flatten() else { continue };
+            let raw = v;
             let v = if stacked {
                 let base_v = acc.get(i).copied().unwrap_or(0.0);
                 if let Some(a) = acc.get_mut(i) {
@@ -723,6 +804,7 @@ fn draw_inner(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, w: f64,
                 err_marks.push((x, to_axis(sec, lo), to_axis(sec, hi), base * 0.4, s.error_bars.as_ref().is_some_and(|e| e.end_cap)));
             }
             pts.push(Point::new(x, to_axis(sec, v)));
+            labelled.push((Point::new(x, to_axis(sec, v)), i, raw));
         }
         if pts.is_empty() {
             continue;
@@ -748,6 +830,15 @@ fn draw_inner(ctx: &mut RenderContext, rctx: &Ctx, c: &Chart, m: Affine, w: f64,
             ctx.set_paint(color(col, 1.0));
             for q in &pts {
                 ctx.fill_path(&kurbo::Circle::new(*q, 3.5).to_path(0.1));
+            }
+        }
+        // Data labels on lines and points (areas have none drawn yet).
+        if !area_kind {
+            for &(q, i, v) in &labelled {
+                if let Some(pt) = point_text(rctx, c, s, i, Some(v), base * 0.9, text_col) {
+                    let (lr, align, anchor) = point_label_box(q, pt.pos, pt.extent());
+                    label(ctx, rctx, m, &pt.text, lr, pt.size, align, anchor, pt.col, pt.bold);
+                }
             }
         }
     }

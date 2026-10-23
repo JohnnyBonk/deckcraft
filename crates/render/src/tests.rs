@@ -2595,3 +2595,76 @@ fn empty_bullet_is_gray_only_while_editing_and_never_in_exports() {
     assert!(changed.iter().any(|(px, _)| px[0] == 179 && px[1] == 179 && px[2] == 179));
     assert!(changed.iter().all(|(px, _)| px[0] >= 179 && px[0] == px[1] && px[1] == px[2]));
 }
+
+/// The bounding box (x0, y0, x1, y1) of the pure-red ink in `img`, if it has any.
+fn red_ink(img: &Image) -> Option<(u32, u32, u32, u32)> {
+    let mut b: Option<(u32, u32, u32, u32)> = None;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let p = img.pixel(x, y);
+            if p[0] > 200 && p[1] < 70 && p[2] < 70 {
+                b = Some(b.map_or((x, y, x, y), |(x0, y0, x1, y1)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y))));
+            }
+        }
+    }
+    b
+}
+
+/// A point's custom label text (`c:dLbl` `c:tx`) is drawn in place of its value, in the run's
+/// colour, size and weight, on column, bar and line charts, even when the series shows no values;
+/// a deleted point label is not drawn.
+#[test]
+fn chart_point_labels_draw_their_custom_text() {
+    use deckcraft_model::chart::PointLabel;
+    let red = ColorRef::rgb(deckcraft_color::Rgba::rgb(255, 0, 0));
+    let custom = PointLabel {
+        text: Some("CUSTOM LABEL TEXT".into()),
+        show_val: Some(true),
+        size: Some(18.0),
+        bold: Some(true),
+        color: Some(red),
+        ..Default::default()
+    };
+    let draw = |c: Chart| {
+        let sh = Shape { id: ShapeId(640), xfrm: Some(Xfrm::new(0.0, 0.0, 960.0, 540.0)), kind: ShapeKind::Chart(Box::new(c)), ..Default::default() };
+        render_slide(&deck_with(vec![sh]), 0, &RenderOpts { scale: 1.0, ..Default::default() })
+    };
+    let chart = |kind: ChartType, labels: Vec<(usize, PointLabel)>| {
+        let mut c = Chart::sample(kind);
+        (c.title, c.legend) = (None, None);
+        c.series.truncate(1);
+        c.categories = vec!["A".into(), "B".into(), "C".into()];
+        c.series[0].values = vec![Some(10.0), Some(10.0), Some(10.0)];
+        c.series[0].fill = Some(deckcraft_model::style::Fill::solid(ColorRef::rgb(deckcraft_color::Rgba::rgb(0x44, 0x72, 0xC4))));
+        c.series[0].line = None;
+        c.series[0].point_labels = labels;
+        c
+    };
+    for kind in [ChartType::Column, ChartType::Bar, ChartType::Line] {
+        let img = draw(chart(kind, vec![(1, custom.clone())]));
+        if let Ok(dir) = std::env::var("DECKCRAFT_CHART_SHOTS") {
+            let _ = std::fs::write(format!("{dir}/point-labels-{kind:?}.png"), img.to_png());
+        }
+        let (x0, y0, x1, y1) = red_ink(&img).unwrap_or_else(|| panic!("{kind:?}: the custom label is drawn"));
+        // Seventeen bold 18 pt characters are far wider than the value "10" would be.
+        assert!(x1 - x0 > 150, "{kind:?}: label ink {x0}..{x1} is the custom text");
+        // On the middle category: the middle third across a column or line chart, down a bar chart.
+        let (mid, extent) = if kind == ChartType::Bar { ((y0 + y1) / 2, 540) } else { ((x0 + x1) / 2, 960) };
+        assert!(mid > extent / 3 && mid < extent * 2 / 3, "{kind:?}: label at {mid}");
+    }
+    // No overrides and no values shown: nothing red.
+    assert!(red_ink(&draw(chart(ChartType::Column, vec![]))).is_none());
+
+    // With the chart's values shown, a deleted point label leaves only that point's label out.
+    let shown = |labels| {
+        let mut c = chart(ChartType::Column, labels);
+        c.data_labels = true;
+        draw(c)
+    };
+    let all = shown(vec![]);
+    let gone = shown(vec![(0, PointLabel { delete: true, ..Default::default() })]);
+    let diff: Vec<u32> =
+        (0..540u32).flat_map(|y| (0..960u32).map(move |x| (x, y))).filter(|&(x, y)| all.pixel(x, y) != gone.pixel(x, y)).map(|(x, _)| x).collect();
+    assert!(!diff.is_empty(), "the deleted label is not drawn");
+    assert!(diff.iter().all(|x| *x < 320), "only the first column's label goes");
+}
